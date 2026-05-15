@@ -17,6 +17,7 @@ fi
 [ "x${TEST}" != "x1" ] || exit 0
 
 cd "${OPENWRT_CUR_DIR}"
+rm -rf tmp
 make defconfig
 # Merge cvn.config so that BUILD_TARGET is part of the name
 cat cvn.config >> .config

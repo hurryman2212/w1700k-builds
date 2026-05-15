@@ -25,14 +25,17 @@ _get_opt() {
   opt_name="$(tr '[:upper:]' '[:lower:]' <<<"${opt_name}")"
   local opt_default="${2}"
   local opt_value
+  local jq_bool='as $v | if ($v|type=="boolean") then (if $v then 1 else 0 end) elif $v == "true" then 1 elif $v == "false" then 0 else $v end'
   if [ "x${GITHUB_EVENT_NAME}" = "xpush" ]; then
     local commit_message
     commit_message="$(jq -crMe ".head_commit.message" "${GITHUB_EVENT_PATH}")"
     opt_value="$(_extract_opt_from_string "${opt_name}" "${commit_message}" "${opt_default}" 1)"
   elif [ "x${GITHUB_EVENT_NAME}" = "xrepository_dispatch" ]; then
-    opt_value="$(jq -crM '(.client_payload.'"${opt_name}"' // "'"${opt_default}"'") as $v | if ($v|type=="boolean") then (if $v then 1 else 0 end) else $v end' "${GITHUB_EVENT_PATH}")"
+    opt_value="$(jq -crM '(.client_payload.'"${opt_name}"' // "'"${opt_default}"'") '"${jq_bool}" "${GITHUB_EVENT_PATH}")"
   elif [ "x${GITHUB_EVENT_NAME}" = "xdeployment" ]; then
-    opt_value="$(jq -crM '(.deployment.payload.'"${opt_name}"' // "'"${opt_default}"'") as $v | if ($v|type=="boolean") then (if $v then 1 else 0 end) else $v end' "${GITHUB_EVENT_PATH}")"
+    opt_value="$(jq -crM '(.deployment.payload.'"${opt_name}"' // "'"${opt_default}"'") '"${jq_bool}" "${GITHUB_EVENT_PATH}")"
+  elif [ "x${GITHUB_EVENT_NAME}" = "xworkflow_dispatch" ]; then
+    opt_value="$(jq -crM '(.inputs.'"${opt_name}"' // "'"${opt_default}"'") '"${jq_bool}" "${GITHUB_EVENT_PATH}")"
   else
     opt_value="${opt_default}"
   fi

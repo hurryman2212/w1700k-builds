@@ -1,15 +1,27 @@
-name: fastbuild ubi2-oc, ubi2, snapshot
+name: fastbuild test
 
 on:
   workflow_dispatch:
+    inputs:
+      rebuild:
+        description: Rebuild the cached builder image from the base build environment
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
+  packages: write
 
 env:
-  DK_USERNAME: ${{secrets.DOCKER_USERNAME}}
-  DK_PASSWORD: ${{secrets.DOCKER_PASSWORD}}
-  GH_TOKEN: ${{secrets.GITHUB_TOKEN}}
+  DK_REGISTRY: ghcr.io
+  DK_USERNAME: ${{ github.repository_owner }}
+  DK_PASSWORD: ${{ secrets.GHCR_TOKEN }}
+  GH_TOKEN: ${{ github.token }}
+  REPO_SECRET: ${{ secrets.REPO_SECRET }}
+  REMOTE_REPOSITORY: hurryman2212/OpenW1700k-test
+  UPSTREAM_REPOSITORY: OpenWRT-fanboy/OpenW1700k
+  LOCAL_AUTHOR_EMAIL: hurryman2212@gmail.com
   CCACHE_DIR: ${{github.workspace}}/ghcache
   CCACHE_MAXSIZE: 2G
 
@@ -29,7 +41,7 @@ jobs:
       matrix:
         mode:
           - normal
-        target: [ubi2-oc, ubi2, SNAPSHOT]
+        target: [test]
         include:
         - mode: normal
           title: Build
@@ -41,7 +53,26 @@ jobs:
     - name: Checkout
       uses: actions/checkout@v6
       with:
-        fetch-depth: 0
+        fetch-depth: 1
+        fetch-tags: false
+
+    - name: Free runner disk space
+      run: |
+        set -euxo pipefail
+
+        df -h
+        sudo docker system prune -af --volumes || true
+        sudo apt-get clean || true
+        sudo rm -rf /var/lib/apt/lists/* || true
+
+        sudo rm -rf /usr/share/dotnet || true
+        sudo rm -rf /usr/local/lib/android || true
+        sudo rm -rf /opt/ghc || true
+        sudo rm -rf /opt/az || true
+        sudo rm -rf /usr/local/share/boost || true
+        sudo rm -rf "${AGENT_TOOLSDIRECTORY:-/opt/hostedtoolcache}" || true
+
+        df -h
 
     - name: Restore ccache from cache
       uses: actions/cache@v5
@@ -52,18 +83,151 @@ jobs:
           ccache-openwrt-${{matrix.target}}.
           ccache-openwrt-
 
-    - name: Download artifact
-      uses: dawidd6/action-download-artifact@v18
-      with:
-        workflow: extract-distfeeds.yaml
-        skip_unpack: true
-
-    - name: Prepare artifact
+    - name: Prepare distfeeds metadata
       run: |
-        mv distfeeds.list.zip distfeeds.list
+        set -euo pipefail
+
+        sudo apt-get update -qq
+        sudo apt-get install -y binwalk
+
+        curl -L --fail --retry 5 \
+          https://downloads.openwrt.org/snapshots/targets/airoha/an7581/openwrt-airoha-an7581-airoha_an7581-evb-squashfs-sysupgrade.bin \
+          --output sysupgrade.bin
+        binwalk -e sysupgrade.bin
+
+        distfeeds_list="$(
+          find _sysupgrade.bin.extracted \
+            -path '*/squashfs-root/etc/apk/repositories.d/distfeeds.list' \
+            -type f |
+          head -n 1
+        )"
+        if [ -z "${distfeeds_list}" ]; then
+          echo "::error::Failed to extract distfeeds.list from snapshot image" >&2
+          exit 1
+        fi
+
         mkdir -p ./user/default/files/etc/apk/repositories.d
-        cp distfeeds.list ./user/default/files/etc/apk/repositories.d/
-        sed -n 's/.*6.18.*-*-\([^/]*\).*/\1/p' distfeeds.list > ./user/default/files/etc/vermagic.txt
+        cp "${distfeeds_list}" ./user/default/files/etc/apk/repositories.d/distfeeds.list
+        sed -n 's/.*6.18.*-*-\([^/]*\).*/\1/p' \
+          "${distfeeds_list}" > ./user/default/files/etc/vermagic.txt
+
+    - name: Sync source repository
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        branch="${{ matrix.target }}"
+        local_author_email="${{ env.LOCAL_AUTHOR_EMAIL }}"
+        source_dir="$(mktemp -d)"
+        trap 'rm -rf "${source_dir}"' EXIT
+
+        git init "${source_dir}"
+        cd "${source_dir}"
+        git remote add origin \
+          "https://x-access-token:${REPO_SECRET}@github.com/${{ env.REMOTE_REPOSITORY }}.git"
+        git config remote.origin.tagOpt --no-tags
+        git fetch --no-tags origin "+refs/heads/${branch}:refs/remotes/origin/${branch}"
+        git checkout -B "${branch}" "origin/${branch}"
+        git config user.name github-actions[bot]
+        git config user.email github-actions[bot]@users.noreply.github.com
+
+        git remote remove fanboy 2>/dev/null || true
+        git remote add fanboy https://github.com/${{ env.UPSTREAM_REPOSITORY }}.git
+        git config remote.fanboy.tagOpt --no-tags
+        git fetch --no-tags origin "+refs/heads/${branch}:refs/remotes/origin/${branch}"
+        git fetch --no-tags fanboy "+refs/heads/${branch}:refs/remotes/fanboy/${branch}"
+
+        mapfile -t replay_candidates < <(
+          git cherry -v "fanboy/${branch}" "origin/${branch}" |
+            awk '$1 == "+" { print $2 }'
+        )
+
+        local_commits=()
+        non_local_commits=()
+        for commit in "${replay_candidates[@]}"; do
+          commit_author="$(git show -s --format=%ae "${commit}")"
+          if [ "${commit_author}" = "${local_author_email}" ]; then
+            local_commits+=("${commit}")
+          else
+            non_local_commits+=("${commit}")
+            printf 'Skipping non-local commit %s authored by %s.\n' \
+              "${commit}" "${commit_author}" >&2
+          fi
+        done
+
+        if git merge-base --is-ancestor "fanboy/${branch}" "origin/${branch}" &&
+           [ "${#non_local_commits[@]}" -eq 0 ]; then
+          printf 'origin/%s already contains %s/%s; using HEAD %s.\n' \
+            "${branch}" "${{ env.UPSTREAM_REPOSITORY }}" "${branch}" \
+            "$(git rev-parse "origin/${branch}")"
+          exit 0
+        fi
+
+        printf 'Local commits to replay on top of %s/%s:\n' \
+          "${{ env.UPSTREAM_REPOSITORY }}" "${branch}"
+        if [ "${#local_commits[@]}" -eq 0 ]; then
+          printf '  none\n'
+        else
+          printf '  %s\n' "${local_commits[@]}"
+        fi
+
+        git checkout -B "${branch}" "fanboy/${branch}"
+
+        resolve_deleted_by_us_conflicts() {
+          local path
+          local status
+          local -a paths
+
+          mapfile -t paths < <(git diff --name-only --diff-filter=U)
+          [ "${#paths[@]}" -gt 0 ] || return 1
+
+          for path in "${paths[@]}"; do
+            status="$(git status --porcelain=v1 -- "${path}" | awk '{print $1}')"
+            if [ "${status}" != "DU" ]; then
+              printf 'Cannot auto-resolve %s: conflict status is %s, not DU.\n' \
+                "${path}" "${status}" >&2
+              return 1
+            fi
+            if ! git cat-file -e ":3:${path}" 2>/dev/null; then
+              printf 'Cannot auto-resolve %s: picked commit has no stage-3 version.\n' \
+                "${path}" >&2
+              return 1
+            fi
+          done
+
+          for path in "${paths[@]}"; do
+            printf 'Auto-resolving %s as picked-commit file addition.\n' \
+              "${path}" >&2
+            git checkout --theirs -- "${path}"
+            git add -- "${path}"
+          done
+
+          ! git diff --name-only --diff-filter=U | grep -q .
+        }
+
+        cherry_pick_local_commit() {
+          local commit="${1}"
+
+          if git cherry-pick "${commit}"; then
+            return 0
+          fi
+
+          if resolve_deleted_by_us_conflicts; then
+            git cherry-pick --continue
+            return 0
+          fi
+
+          git status --short >&2
+          return 1
+        }
+
+        for commit in "${local_commits[@]}"; do
+          cherry_pick_local_commit "${commit}"
+        done
+
+        git push \
+          --force-with-lease="refs/heads/${branch}:$(git rev-parse "origin/${branch}")" \
+          origin "HEAD:${branch}"
 
     - name: Initialize build environment
       run: |
@@ -135,18 +299,21 @@ jobs:
         set -eo pipefail
         source "${HOST_WORK_DIR}/scripts/host/docker.sh"
 
-        # Clone/update OpenWrt
         docker_exec "${BUILDER_CONTAINER_ID}" "${BUILDER_WORK_DIR}/scripts/update_repo.sh"
         docker_exec "${BUILDER_CONTAINER_ID}" "${BUILDER_WORK_DIR}/scripts/update_feeds.sh"
-
-        # Apply customizations
         docker_exec "${BUILDER_CONTAINER_ID}" "${BUILDER_WORK_DIR}/scripts/customize.sh"
-
-        # Prepare config file
         docker_exec "${BUILDER_CONTAINER_ID}" "${BUILDER_WORK_DIR}/scripts/config.sh"
-
-        # Download packages
         docker_exec "${BUILDER_CONTAINER_ID}" "${BUILDER_WORK_DIR}/scripts/download.sh"
+
+    - name: Disk usage before build
+      run: |
+        set -eo pipefail
+
+        df -h
+        docker system df || true
+        du -sh "${CCACHE_DIR}" 2>/dev/null || true
+        du -sh "${HOST_BIN_DIR}" 2>/dev/null || true
+        du -sh /tmp/builder 2>/dev/null || true
 
     - name: Compile OpenWrt with multiple threads
       id: compile
@@ -163,7 +330,27 @@ jobs:
       run: |
         set -eo pipefail
         source "${HOST_WORK_DIR}/scripts/host/docker.sh"
-        docker_exec -e MODE=s "${BUILDER_CONTAINER_ID}" "${BUILDER_WORK_DIR}/scripts/compile.sh"
+        docker_exec -e MODE=s "${BUILDER_CONTAINER_ID}" bash -lc '
+          set -eo pipefail
+          log="/tmp/openwrt-verbose-build.log"
+          "${BUILDER_WORK_DIR}/scripts/compile.sh" >"${log}" 2>&1 || {
+            status=$?
+            echo "::error::Verbose rebuild failed. Showing last 500 log lines from ${log}."
+            tail -n 500 "${log}" || true
+            exit "${status}"
+          }
+        '
+
+    - name: Disk usage after build
+      if: always()
+      run: |
+        set -eo pipefail
+
+        df -h
+        docker system df || true
+        du -sh "${CCACHE_DIR}" 2>/dev/null || true
+        du -sh "${HOST_BIN_DIR}" 2>/dev/null || true
+        du -sh /tmp/builder 2>/dev/null || true
 
     - name: Organize files
       id: organize
@@ -181,12 +368,20 @@ jobs:
     - name: Create Release
       if: steps.organize.outputs.status == 'success' && !cancelled()
       run: |
+        set -eo pipefail
+
+        TARGET="${{matrix.target}}"
         version_code=$(jq -r '.version_code' ./openwrt_firmware/profiles.json)
-        VERSION="${{matrix.target}}-$(date +'%Y.%m.%d')-${version_code}"
+        VERSION="${TARGET}-$(date +'%Y.%m.%d')-${version_code}"
         sed -i "s/^/    /; 1s/^/## $VERSION\n\n/" "${HOST_BIN_DIR}/build_info"
-        if gh release view "$VERSION" &>/dev/null; then
-          gh release delete "$VERSION" --cleanup-tag -y
-        fi
+
+        gh release list --limit 1000 --json tagName \
+          --jq ".[].tagName | select(startswith(\"${TARGET}-\"))" |
+        while IFS= read -r tag; do
+          [ -n "$tag" ] || continue
+          gh release delete "$tag" --cleanup-tag -y
+        done
+
         FILES_TO_UPLOAD=$(find ./openwrt_firmware -maxdepth 1 -type f -name "*sysupgrade.itb")
         gh release create "$VERSION" $FILES_TO_UPLOAD \
           --title "$VERSION" \
@@ -211,3 +406,13 @@ jobs:
         if [ "x${OPT_REBUILD}" = "x1" ]; then
           create_remote_tag_alias "${BUILDER_IMAGE_ID_INC}" "${BUILDER_IMAGE_ID_BASE}"
         fi
+
+    - name: Cleanup runner resources
+      if: always()
+      run: |
+        set -eo pipefail
+
+        docker container rm -fv "${BUILDER_CONTAINER_ID}" 2>/dev/null || true
+        docker container prune -f || true
+        docker system prune -af --volumes || true
+        df -h

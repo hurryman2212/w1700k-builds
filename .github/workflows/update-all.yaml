@@ -1,36 +1,139 @@
-name: update-all
+name: update OpenW1700k-test test branch
 
 on:
-  schedule:
-    - cron: '15 */2 * * *'
   workflow_dispatch:
 
 env:
-  REMOTE_REPOSITORY: OpenWRT-fanboy/OpenW1700k
+  REMOTE_REPOSITORY: hurryman2212/OpenW1700k-test
+  UPSTREAM_REPOSITORY: OpenWRT-fanboy/OpenW1700k
+  LOCAL_AUTHOR_EMAIL: hurryman2212@gmail.com
 
 jobs:
   update:
-    name: Update ${{ matrix.environment }} branch
+    name: Update test branch
     runs-on: ubuntu-slim
     strategy:
       matrix:
-        environment: [main, snapshot, ubi2-oc-auto]
+        environment: [test]
     permissions:
       contents: write
     environment: ${{ matrix.environment }}
     steps:
-      - name: Checkout remote repository
-        uses: actions/checkout@main
-        with:
-          repository: ${{ env.REMOTE_REPOSITORY }}
-          ref: ${{ matrix.environment }}
-          fetch-depth: 0
-          token: ${{ secrets.REPO_SECRET }}
-      - name: Pull updates then push
+      - name: Checkout remote repository without tags
+        shell: bash
         run: |
+          set -euo pipefail
+
+          branch="${{ matrix.environment }}"
+          git init
+          git remote add origin \
+            "https://x-access-token:${{ secrets.REPO_SECRET }}@github.com/${{ env.REMOTE_REPOSITORY }}.git"
+          git config remote.origin.tagOpt --no-tags
+          git fetch --no-tags origin "+refs/heads/${branch}:refs/remotes/origin/${branch}"
+          git checkout -B "${branch}" "origin/${branch}"
+      - name: Sync with fanboy test and replay local commits
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          branch="${{ matrix.environment }}"
           git config user.name github-actions[bot]
           git config user.email github-actions[bot]@users.noreply.github.com
-          git remote add openwrt https://github.com/openwrt/openwrt.git
-          git remote update
-          git rebase openwrt/main
-          git push --force-with-lease
+          local_author_email="${{ env.LOCAL_AUTHOR_EMAIL }}"
+
+          git remote remove fanboy 2>/dev/null || true
+          git remote add fanboy https://github.com/${{ env.UPSTREAM_REPOSITORY }}.git
+          git config remote.fanboy.tagOpt --no-tags
+          git fetch --no-tags origin "+refs/heads/${branch}:refs/remotes/origin/${branch}"
+          git fetch --no-tags fanboy "+refs/heads/${branch}:refs/remotes/fanboy/${branch}"
+
+          mapfile -t replay_candidates < <(
+            git cherry -v "fanboy/${branch}" "origin/${branch}" |
+              awk '$1 == "+" { print $2 }'
+          )
+
+          local_commits=()
+          non_local_commits=()
+          for commit in "${replay_candidates[@]}"; do
+            commit_author="$(git show -s --format=%ae "${commit}")"
+            if [ "${commit_author}" = "${local_author_email}" ]; then
+              local_commits+=("${commit}")
+            else
+              non_local_commits+=("${commit}")
+              printf 'Skipping non-local commit %s authored by %s.\n' \
+                "${commit}" "${commit_author}" >&2
+            fi
+          done
+
+          if git merge-base --is-ancestor "fanboy/${branch}" "origin/${branch}" &&
+             [ "${#non_local_commits[@]}" -eq 0 ]; then
+            printf 'origin/%s already contains %s/%s; nothing to replay.\n' \
+              "${branch}" "${{ env.UPSTREAM_REPOSITORY }}" "${branch}"
+            exit 0
+          fi
+
+          printf 'Local commits to replay on top of %s/%s:\n' \
+            "${{ env.UPSTREAM_REPOSITORY }}" "${branch}"
+          if [ "${#local_commits[@]}" -eq 0 ]; then
+            printf '  none\n'
+          else
+            printf '  %s\n' "${local_commits[@]}"
+          fi
+
+          git checkout -B "${branch}" "fanboy/${branch}"
+
+          resolve_deleted_by_us_conflicts() {
+            local path
+            local status
+            local -a paths
+
+            mapfile -t paths < <(git diff --name-only --diff-filter=U)
+            [ "${#paths[@]}" -gt 0 ] || return 1
+
+            for path in "${paths[@]}"; do
+              status="$(git status --porcelain=v1 -- "${path}" | awk '{print $1}')"
+              if [ "${status}" != "DU" ]; then
+                printf 'Cannot auto-resolve %s: conflict status is %s, not DU.\n' \
+                  "${path}" "${status}" >&2
+                return 1
+              fi
+              if ! git cat-file -e ":3:${path}" 2>/dev/null; then
+                printf 'Cannot auto-resolve %s: picked commit has no stage-3 version.\n' \
+                  "${path}" >&2
+                return 1
+              fi
+            done
+
+            for path in "${paths[@]}"; do
+              printf 'Auto-resolving %s as picked-commit file addition.\n' \
+                "${path}" >&2
+              git checkout --theirs -- "${path}"
+              git add -- "${path}"
+            done
+
+            ! git diff --name-only --diff-filter=U | grep -q .
+          }
+
+          cherry_pick_local_commit() {
+            local commit="${1}"
+
+            if git cherry-pick "${commit}"; then
+              return 0
+            fi
+
+            if resolve_deleted_by_us_conflicts; then
+              git cherry-pick --continue
+              return 0
+            fi
+
+            git status --short >&2
+            return 1
+          }
+
+          for commit in "${local_commits[@]}"; do
+            cherry_pick_local_commit "${commit}"
+          done
+
+          git push \
+            --force-with-lease="refs/heads/${branch}:$(git rev-parse "origin/${branch}")" \
+            origin "HEAD:${branch}"

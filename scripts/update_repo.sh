@@ -25,6 +25,25 @@ link_bin() {
   fi
 }
 
+write_build_info() {
+  mkdir -p files
+
+  if git fetch --no-tags https://github.com/openwrt/openwrt.git \
+      "+refs/heads/main:refs/remotes/openwrt/main" &&
+     git rev-parse --verify refs/remotes/openwrt/main >/dev/null 2>&1; then
+    git log --oneline --no-decorate \
+      refs/remotes/openwrt/main.."${REPO_BRANCH}" > files/build_info
+  else
+    echo "(failed to fetch openwrt/main for build info)" > files/build_info
+  fi
+
+  if [ ! -s files/build_info ]; then
+    echo "(no commits ahead of openwrt/main)" > files/build_info
+  fi
+
+  cp files/build_info "${BUILDER_BIN_DIR}" 2>/dev/null || true
+}
+
 if [ -z "${OPENWRT_COMPILE_DIR}" ] || [ -z "${OPENWRT_CUR_DIR}" ] || [ -z "${OPENWRT_SOURCE_DIR}" ]; then
   echo "::error::'OPENWRT_COMPILE_DIR', 'OPENWRT_CUR_DIR' or 'OPENWRT_SOURCE_DIR' is empty" >&2
   exit 1
@@ -49,21 +68,23 @@ fi
 if [ "x${OPENWRT_CUR_DIR}" != "x${OPENWRT_COMPILE_DIR}" ] && [ -d "${OPENWRT_COMPILE_DIR}/.git" ] && [ "x${OPT_UPDATE_REPO}" != "x1" ]; then
   git clone "${OPENWRT_COMPILE_DIR}" "${OPENWRT_CUR_DIR}"
   git -C "${OPENWRT_CUR_DIR}" remote set-url origin "${REPO_URL}"
-  git -C "${OPENWRT_CUR_DIR}" fetch
-  git -C "${OPENWRT_CUR_DIR}" checkout "${REPO_BRANCH}"
-  git -C "${OPENWRT_CUR_DIR}" pull --rebase
+  git -C "${OPENWRT_CUR_DIR}" config remote.origin.tagOpt --no-tags
+  git -C "${OPENWRT_CUR_DIR}" fetch --no-tags origin "${REPO_BRANCH}"
+  git -C "${OPENWRT_CUR_DIR}" checkout -B "${REPO_BRANCH}" "origin/${REPO_BRANCH}"
+  git -C "${OPENWRT_CUR_DIR}" reset --hard "origin/${REPO_BRANCH}"
+  cd "${OPENWRT_CUR_DIR}"
+  write_build_info
  else
 #  git clone -b "${REPO_BRANCH}" "${REPO_URL}" "${OPENWRT_CUR_DIR}"
   mkdir -p "${OPENWRT_CUR_DIR}"
   cd "${OPENWRT_CUR_DIR}"
   git init
   git remote add origin "${REPO_URL}" 2>/dev/null || git remote set-url origin "${REPO_URL}"
-  git fetch
-  git checkout "${REPO_BRANCH}"
-  git pull --rebase
-  mkdir -p files
-  git log origin/main.."${REPO_BRANCH}" --oneline > files/build_info 2>/dev/null || echo "(no commits ahead of main)" > files/build_info
-  cp files/build_info "${BUILDER_BIN_DIR}" 2>/dev/null || true
+  git config remote.origin.tagOpt --no-tags
+  git fetch --no-tags origin "${REPO_BRANCH}"
+  git checkout -B "${REPO_BRANCH}" "origin/${REPO_BRANCH}"
+  git reset --hard "origin/${REPO_BRANCH}"
+  write_build_info
 fi
 
 link_bin

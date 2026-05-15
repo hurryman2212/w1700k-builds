@@ -7,6 +7,30 @@
 # Author: Texot
 #=================================================
 
+_exit_if_empty() {
+  local var_name="${1}"
+  local var_value="${2}"
+  local hint="${3:-}"
+
+  if [ -n "${var_value}" ]; then
+    return
+  fi
+
+  if [ -n "${hint}" ]; then
+    echo "::error::Missing input ${var_name}: ${hint}" >&2
+  else
+    echo "::error::Missing input ${var_name}" >&2
+  fi
+  exit 1
+}
+
+check_required_input() {
+  _exit_if_empty DK_REGISTRY "${DK_REGISTRY:-}"
+  _exit_if_empty DK_USERNAME "${DK_USERNAME:-}"
+  _exit_if_empty DK_PASSWORD "${DK_PASSWORD:-}" \
+    "set secrets.GHCR_TOKEN with access to ghcr.io/${DK_USERNAME}/${BUILDER_NAME:-w1700k-builders}"
+}
+
 configure_docker() {
   echo '{
     "max-concurrent-downloads": 50,
@@ -17,6 +41,7 @@ configure_docker() {
 }
 
 login_to_registry() {
+  check_required_input
   echo "${DK_PASSWORD}" | docker login -u "${DK_USERNAME}" --password-stdin "${DK_REGISTRY}"
 }
 
@@ -31,7 +56,7 @@ pull_image() {
         echo "::error::Your image has exceeded maximum layer limit. Normally this should have already been automatically handled, but obviously haven't. You need to manually rebase or rebuild this builder, or delete it on the Docker Hub website." >&2
         exit 1
       fi
-      [ "x${STRICT_PULL}" != "x1" ] || exit $ret_val
+      exit $ret_val
     )
   else
     echo "No argument for pulling" >&2
