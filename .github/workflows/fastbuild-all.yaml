@@ -7,9 +7,11 @@ permissions:
   contents: write
 
 env:
-  DK_USERNAME: ${{ secrets.DOCKER_USERNAME }}
-  DK_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
-  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  DK_USERNAME: ${{secrets.DOCKER_USERNAME}}
+  DK_PASSWORD: ${{secrets.DOCKER_PASSWORD}}
+  GH_TOKEN: ${{secrets.GITHUB_TOKEN}}
+  CCACHE_DIR: ${{github.workspace}}/ghcache
+  CCACHE_MAXSIZE: 2G
 
 jobs:
   build:
@@ -41,6 +43,15 @@ jobs:
       with:
         fetch-depth: 0
 
+    - name: Restore ccache from cache
+      uses: actions/cache@v5
+      with:
+        path: ${{github.workspace}}/ghcache
+        key: ccache-openwrt-${{matrix.target}}.${{github.run_id}}
+        restore-keys: |
+          ccache-openwrt-${{matrix.target}}.
+          ccache-openwrt-
+
     - name: Download artifact
       uses: dawidd6/action-download-artifact@v18
       with:
@@ -59,7 +70,7 @@ jobs:
         set -eo pipefail
         source scripts/host/docker.sh
         source scripts/lib/gaction.sh
-        
+
         "${HOST_WORK_DIR}/scripts/host/init_runner.sh" main build
         configure_docker
         login_to_registry
@@ -72,13 +83,13 @@ jobs:
         set -eo pipefail
         source "${HOST_WORK_DIR}/scripts/host/docker.sh"
         source "${HOST_WORK_DIR}/scripts/lib/gaction.sh"
-        
+
         if [ "x${OPT_REBUILD}" != "x1" ]; then
           set +eo pipefail
           docker buildx imagetools inspect "${BUILDER_IMAGE_ID_INC}" > /dev/null 2>&1
           builder_inc_ret_val=$?
           set -eo pipefail
-          
+
           if [ "x${OPT_REBASE}" = "x1" ] || [ "x${builder_inc_ret_val}" != "x0" ]; then
             set +eo pipefail
             docker buildx imagetools inspect "${BUILDER_IMAGE_ID_BASE}" >/dev/null 2>&1
@@ -93,7 +104,7 @@ jobs:
             fi
           fi
         fi
-        
+
         if [ "x${OPT_REBUILD}" = "x1" ]; then
           echo "Re-creating base builder '${BUILDER_IMAGE_ID_BASE}'"
         fi
@@ -103,8 +114,14 @@ jobs:
       run: |
         set -eo pipefail
         source "${HOST_WORK_DIR}/scripts/host/docker.sh"
-        
+
+        # Ensure ccache directory exists
+        mkdir -p "${CCACHE_DIR}"
+
         eval "declare -a MOUNT_OPTS=( $(printf '%b' "${BUILDER_MOUNT_OPTS//%/\\x}") )"
+        # Add ccache mount to MOUNT_OPTS
+        MOUNT_OPTS+=( "--mount" "type=bind,source=${CCACHE_DIR},target=/ghcache" )
+
         if [ "x${OPT_REBUILD}" != "x1" ]; then
           pull_image "${BUILDER_IMAGE_ID_INC}"
           docker run -d -t --name "${BUILDER_CONTAINER_ID}" "${MOUNT_OPTS[@]}" --env GITHUB_ENV=${GITHUB_ENV} "${BUILDER_IMAGE_ID_INC}"
@@ -117,17 +134,17 @@ jobs:
       run: |
         set -eo pipefail
         source "${HOST_WORK_DIR}/scripts/host/docker.sh"
-        
+
         # Clone/update OpenWrt
         docker_exec "${BUILDER_CONTAINER_ID}" "${BUILDER_WORK_DIR}/scripts/update_repo.sh"
         docker_exec "${BUILDER_CONTAINER_ID}" "${BUILDER_WORK_DIR}/scripts/update_feeds.sh"
-        
+
         # Apply customizations
         docker_exec "${BUILDER_CONTAINER_ID}" "${BUILDER_WORK_DIR}/scripts/customize.sh"
-        
+
         # Prepare config file
         docker_exec "${BUILDER_CONTAINER_ID}" "${BUILDER_WORK_DIR}/scripts/config.sh"
-        
+
         # Download packages
         docker_exec "${BUILDER_CONTAINER_ID}" "${BUILDER_WORK_DIR}/scripts/download.sh"
 
@@ -153,7 +170,7 @@ jobs:
       run: |
         set -eo pipefail
         shopt -s extglob
-        
+
         sudo chown -R "$(id -u):$(id -g)" "${HOST_BIN_DIR}"
         mkdir "${HOST_WORK_DIR}/openwrt_firmware"
         cd "${HOST_BIN_DIR}/targets/"*/*
@@ -184,7 +201,7 @@ jobs:
       run: |
         set -eo pipefail
         source "${HOST_WORK_DIR}/scripts/host/docker.sh"
-        
+
         docker_exec "${BUILDER_CONTAINER_ID}" "${BUILDER_WORK_DIR}/scripts/pre_commit.sh"
         docker commit -a "openwrtfanboy/openwrt-fastbuild" -m "Building at $(date)" "${BUILDER_CONTAINER_ID}" "${BUILDER_IMAGE_ID_INC}"
         docker container rm -fv "${BUILDER_CONTAINER_ID}"
