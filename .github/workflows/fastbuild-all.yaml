@@ -1,4 +1,4 @@
-name: fastbuild test, ubi2-oc, ubi2, tiger, snapshot
+name: fastbuild ubi2-oc, ubi2, snapshot
 
 on:
   workflow_dispatch:
@@ -29,7 +29,7 @@ jobs:
       matrix:
         mode:
           - normal
-        target: [test, ubi2-oc, ubi2, tiger, SNAPSHOT]
+        target: [ubi2-oc, ubi2, SNAPSHOT]
         include:
         - mode: normal
           title: Build
