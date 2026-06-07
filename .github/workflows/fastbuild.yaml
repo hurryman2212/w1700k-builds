@@ -1,0 +1,120 @@
+name: fastbuild ubi2-oc, ubi2, snapshot
+on: workflow_dispatch
+permissions: write-all
+env:
+  GH_TOKEN: ${{ github.token }}
+  CID: ${{ github.event.repository.name }}
+  DK_OPENWRT: /bld/openwrt
+  DK_BIN: /bld/openwrt_bin
+  DK_USER: /bld/user
+  DK_PROFILE: /bld/user/current
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ubuntu-24.04-arm
+    strategy:
+      fail-fast: false
+      matrix: {target: [ubi2-oc, ubi2, SNAPSHOT]}
+    steps:
+    - uses: actions/checkout@v7
+
+    - uses: actions/cache@v5
+      with: {path: ghcache, key: 'ccache-${{ matrix.target }}.${{ github.run_id }}', restore-keys: 'ccache-${{ matrix.target }}.'}
+    - uses: actions/cache@v5
+      with: {path: stcache, key: 'staging-${{ matrix.target }}.${{ github.run_id }}', restore-keys: 'staging-${{ matrix.target }}.'}
+    - uses: actions/cache@v5
+      with: {path: dlcache, key: 'dlcache.${{ github.run_id }}', restore-keys: dlcache.}
+
+    - name: Initialize environment
+      run: |
+        mkdir -p user/default/files/etc/apk/repositories.d user/current openwrt_bin ghcache stcache dlcache
+        curl -Z -Lo user/default/files/etc/vermagic.txt https://w1700k.github.io/builds/vermagic.txt \
+          -Lo user/default/files/etc/apk/repositories.d/distfeeds.list https://w1700k.github.io/builds/distfeeds.list
+        sudo tee /etc/docker/daemon.json <<< '{"max-concurrent-downloads":50,"max-concurrent-uploads":50,"experimental":true}'
+        sudo systemctl reload docker
+        docker login ghcr.io -u "${{ github.actor }}" --password-stdin <<< "$GH_TOKEN"
+        [ -d "user/${{ matrix.target }}" ] || { echo "::error::Target ${{ matrix.target }} not found"; exit 1; }
+        rsync -aI user/default/ user/current/ 2>/dev/null
+        rsync -aI "user/${{ matrix.target }}/" user/current/
+        echo CONFIG_VERSION_NUMBER=${{ matrix.target }} > user/current/cvn.config
+        [ -f user/current/config.diff ] || { echo "::error::config.diff not found"; exit 1; }
+        echo 'CONFIG_CCACHE_DIR="/ghcache"' >> user/current/config.diff
+        declare -l IMG_BASE="ghcr.io/${{ github.repository_owner }}/$CID:${{ matrix.target }}"
+        IMG_INC="$IMG_BASE-inc"
+        if docker pull $IMG_INC 2>/dev/null; then IMAGE=$IMG_INC
+        elif docker pull $IMG_BASE 2>/dev/null; then IMAGE=$IMG_BASE
+        else REBUILD=1; IMAGE=ghcr.io/w1700k/fastbuild_base:debian-arm
+        fi
+        printf '%s\n' "REBUILD=$REBUILD" "IMG_BASE=$IMG_BASE" "IMG_INC=$IMG_INC" >> $GITHUB_ENV
+        docker run -d -t --name $CID -v $PWD/user:$DK_USER -v $PWD/openwrt_bin:$DK_BIN -v $PWD/ghcache:/ghcache -v $PWD/stcache:/stcache -v $PWD/dlcache:/dlcache --env GITHUB_ENV=$GITHUB_ENV $IMAGE
+        install -m 755 /dev/stdin /usr/local/bin/docker_exec <<'DKR'
+        #!/bin/bash
+        for n in DK_BIN DK_USER DK_PROFILE DK_OPENWRT REBUILD; do e+=(-e "$n=${!n}"); done
+        exec docker exec -u 0 -i "${e[@]}" "$@"
+        DKR
+
+    - name: Prepare OpenWrt source
+      run: |
+        docker_exec $CID bash -c '
+          . $DK_USER/default/settings.ini &>/dev/null ||:
+          . $DK_PROFILE/settings.ini
+          [[ $REPO_URL && $REPO_BRANCH ]] || { echo "::error::Missing REPO_URL or REPO_BRANCH"; exit 1; }
+          export REPO_URL REPO_BRANCH
+          mkdir -p $DK_OPENWRT/files
+          cd $DK_OPENWRT
+          if ((REBUILD)) || [ ! -d .git ]; then git init; fi
+          git remote set-url origin $REPO_URL 2>/dev/null || git remote add origin $REPO_URL
+          git fetch && git checkout $REPO_BRANCH && git pull --rebase
+          { git log origin/main..$REPO_BRANCH --oneline || echo "(no commits ahead of main)"; } > files/build_info
+          mountpoint $DK_BIN || { echo "::error::not mounted" >&2; exit 1; }
+          cp files/build_info $DK_BIN
+          ln -sf $DK_BIN bin
+          ln -sf /dlcache dl
+          ln -sf /stcache staging_dir
+          bp=$DK_PROFILE
+          fc=feeds.conf
+          cp $bp/files/$fc $fc 2>/dev/null && cp $fc /tmp/feeds.bak
+          ((! REBUILD)) && ./scripts/feeds list -fs > /tmp/feeds.prev 2>/dev/null && mv /tmp/feeds.prev $fc
+          rm -rf feeds/* &>/dev/null; ./scripts/feeds update -a &>/dev/null; ./scripts/feeds install -a
+          mv /tmp/feeds.bak $fc &>/dev/null ||:
+          cp $bp/config.diff .config
+          cat $bp/patches/*.patch 2>/dev/null | patch -d . -p0 --forward ||:
+          cp -r $bp/files/ . &>/dev/null ||:
+          bash $bp/custom.sh &>/dev/null ||:
+          make defconfig; cat $bp/cvn.config >> .config
+          make download -j8
+        '
+
+    - name: Compile OpenWrt
+      run: |
+        for mode in c s; do
+          docker_exec -e MODE=$mode $CID bash -c '
+            bash $DK_PROFILE/pre_compile.sh 2>/dev/null ||:
+            cd $DK_OPENWRT
+            export FORCE_UNSAFE_CONFIGURE=1
+            make -j$(($(nproc) + 1)) V=$MODE
+          ' && break
+        done
+
+    - name: Create release
+      run: |
+        sudo chown -R "$(id -u):$(id -g)" openwrt_bin stcache
+        find -L openwrt_bin/targets/*/* -maxdepth 1 -type f -exec install -D -t firmware {} +
+        VERSION="${{ matrix.target }}_$(date +'%Y.%m.%d')_$(jq -r '.version_code' firmware/profiles.json)"
+        sed -i "s/^/    /; 1s/^/## $VERSION\n\n/" openwrt_bin/build_info
+        gh release list --json tagName --jq '.[].tagName' | grep "^${{ matrix.target }}_" | xargs -r gh release delete --cleanup-tag -y || true
+        gh release create $VERSION firmware/*sysupgrade.itb --title $VERSION --notes-file openwrt_bin/build_info
+
+    - name: Upload builder container
+      run: |
+        docker_exec $CID bash -c 'cd $DK_OPENWRT && rm -rf bin build_dir feeds tmp && find dl -type f -mtime +30 -delete'
+        docker commit -a openwrt-fastbuild -m "Building at $(date)" $CID $IMG_INC
+        docker push $IMG_INC
+        if ((REBUILD)); then docker buildx imagetools create -t $IMG_BASE $IMG_INC; fi
+
+    - name: Delete old caches
+      if: success()
+      run: |
+        for p in dlcache. staging-${{ matrix.target }}. ccache-${{ matrix.target }}.; do
+          gh cache list --json key,id --jq '.[] | select(.key | startswith("'"$p"'")) | .id' | xargs -r gh cache delete
+        done || true
