@@ -1,5 +1,8 @@
-name: fastbuild ubi2-oc, ubi2, snapshot
-on: workflow_dispatch
+name: Prepare fastbuild base image
+on:
+  schedule:
+    -   cron: '42 09 * * *'
+  workflow_dispatch:
 permissions: write-all
 jobs:
   build:
@@ -12,6 +15,7 @@ jobs:
       DK_USER: /bld/user
       DK_PROFILE: /bld/user/current
       GH_TOKEN: ${{ github.token }}
+      IMG_BASE: ghcr.io/w1700k/fastbuild_base:base-builder
       IMG_INC: ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}:${{ matrix.target }}-inc
     steps:
     - uses: actions/checkout@v7
@@ -19,32 +23,25 @@ jobs:
     - uses: docker/login-action@v4
       with: {registry: ghcr.io, username: '${{ github.actor }}', password: '${{ github.token }}'}
 
-    - id: gh
-      uses: actions/cache/restore@v5
-      with: {path: "ghcache\nstcache", key: 'cache-${{ matrix.target }}.${{ github.run_id }}', restore-keys: 'cache-${{ matrix.target }}.'}
-    - id: dl
-      uses: actions/cache/restore@v5
-      with: {path: dlcache, key: 'dlcache.${{ github.run_id }}', restore-keys: dlcache.}
-
-    - name: Seed caches if missing
+    - name: Seed caches from toolchain
       run: |
         mkdir -p openwrt_bin ghcache stcache dlcache
         if [ -z "$(ls -A ghcache 2>&-)" ] || [ -z "$(ls -A stcache 2>&-)" ]; then
-          I=ghcr.io/w1700k/fastbuild_base:base-bldcache-${{ matrix.target }}
-          docker pull $I 2>&- && { docker create --name CA $I >/dev/null; for d in ghcache stcache dlcache; do docker cp CA:/$d/. $d; done; }
+          I=ghcr.io/w1700k/fastbuild_base:base-toolcache-${{ matrix.target }}
+          docker pull $I 2>&- && { docker create --name CA $I >/dev/null; for d in ghcache stcache; do docker cp CA:/$d/. $d; done; }
         fi
 
     - name: Initialize environment
       run: |
+        mkdir -p openwrt_bin ghcache stcache dlcache
         curl -Z --create-dirs -Lo user/default/files/etc/apk/repositories.d/distfeeds.list https://w1700k.github.io/builds/distfeeds.list
         curl -Z -Lo user/default/files/etc/vermagic.txt https://w1700k.github.io/builds/vermagic.txt
+        sudo tee /etc/docker/daemon.json <<< '{"max-concurrent-downloads":50,"max-concurrent-uploads":50,"experimental":true}'
+        sudo systemctl reload docker
         [ -f "user/${{ matrix.target }}/config.diff" ] || { echo "::error::config.diff not found for ${{ matrix.target }}"; exit 1; }
         rsync -aI --mkpath user/default/ user/${{ matrix.target }}/ user/current/ 2>&-
         echo 'CONFIG_CCACHE_DIR="/ghcache"' >> user/current/config.diff
-        sudo tee /etc/docker/daemon.json <<< '{"max-concurrent-downloads":50,"max-concurrent-uploads":50,"experimental":true}'
-        sudo systemctl reload docker
-        IMAGE=$IMG_INC; docker pull $IMAGE 2>&- || IMAGE=ghcr.io/w1700k/fastbuild_base:base-builder
-        docker run -dt --name DK -v $PWD/user:$DK_USER -v $PWD/openwrt_bin:$DK_BIN -v $PWD/ghcache:/ghcache -v $PWD/stcache:/stcache -v $PWD/dlcache:/dlcache $IMAGE
+        docker run -dt --name DK -v $PWD/user:$DK_USER -v $PWD/openwrt_bin:$DK_BIN -v $PWD/ghcache:/ghcache -v $PWD/stcache:/stcache -v $PWD/dlcache:/dlcache ghcr.io/w1700k/fastbuild_base:base-toolchain
         install -m 755 /dev/stdin /usr/local/bin/docker_exec <<'DKR'
         #!/bin/bash
         for n in DK_BIN DK_USER DK_PROFILE DK_OPENWRT; do e+=(-e "$n=${!n}"); done
@@ -102,19 +99,19 @@ jobs:
     - name: Upload builder container
       run: |
         docker_exec DK bash -c 'cd $DK_OPENWRT && rm -rf bin build_dir feeds tmp'
-        docker commit -a openwrt-fastbuild -m "Building at $(date)" DK $IMG_INC
-        docker push $IMG_INC
+        docker commit -a openwrt-fastbuild -m "Building at $(date)" DK $IMG_BASE
+        docker push $IMG_BASE
+        docker buildx imagetools create -t $IMG_INC $IMG_BASE
+        IMAGE="ghcr.io/w1700k/fastbuild_base:base-bldcache-${{ matrix.target }}"
+        docker build -t "$IMAGE" -f- . <<'DKR'
+        FROM busybox
+        COPY dlcache /dlcache
+        COPY stcache /stcache
+        COPY ghcache /ghcache
+        DKR
+        docker push "$IMAGE"
 
-    - name: Delete old caches
-      if: always()
-      run: |
-        for p in dlcache. cache-${{ matrix.target }}.; do
-          gh cache list --json key,id --jq '.[] | select(.key | startswith("'"$p"'")) | .id' | xargs -r gh cache delete
-        done ||:
-
-    - uses: actions/cache/save@v5
-      if: always()
-      with: {path: "ghcache\nstcache", key: '${{ steps.gh.outputs.cache-primary-key }}'}
-    - uses: actions/cache/save@v5
-      if: always()
-      with: {path: dlcache, key: '${{ steps.dl.outputs.cache-primary-key }}'}
+    - name: Cleanup old ghcr images
+      uses: dataaxiom/ghcr-cleanup-action@v1
+      with:
+        package: fastbuild_base
