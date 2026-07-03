@@ -72,7 +72,6 @@ jobs:
             cd $DK_OPENWRT
             export FORCE_UNSAFE_CONFIGURE=1 CCACHE_SLOPPINESS=file_stat_matches,include_file_mtime,time_macros CCACHE_NOHASHDIR=true CCACHE_COMPILERCHECK=content
             make -j$(($(nproc) + 1)) V=$MODE toolchain/install
-            make -j$(($(nproc) + 1)) V=$MODE target/linux/compile
             staging_dir/host/bin/ccache -d /ghcache -sz ||:
           ' && break
         done
