@@ -1,0 +1,570 @@
+name: fastbuild ubi2-oc-offload
+
+on:
+  workflow_dispatch:
+    inputs:
+      clean_rebuild:
+        description: Ignore restored caches and reusable images for this build
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  actions: write
+  contents: write
+  packages: write
+
+concurrency:
+  group: fastbuild-ubi2-oc-offload
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build ubi2-oc-offload
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 360
+    env:
+      DK_OPENWRT: /bld/openwrt
+      DK_BIN: /bld/openwrt_bin
+      DK_USER: /bld/user
+      DK_PROFILE: /bld/user/current
+      GH_TOKEN: ${{ github.token }}
+      REPO_SECRET: ${{ secrets.REPO_SECRET }}
+      TARGET: ubi2-oc-offload
+      CACHE_SCHEMA: v2
+      BUILD_ENV_SCHEMA: v2
+      IMG_BASE: ghcr.io/${{ github.repository_owner }}/w1700k-builders:base-builder
+      IMG_INC: ghcr.io/${{ github.repository_owner }}/w1700k-builders:ubi2-oc-offload-inc
+      IMG_PUBLIC_BASE: ghcr.io/w1700k/fastbuild_base:base-builder
+      IMG_PUBLIC_CACHE: ghcr.io/w1700k/fastbuild_base:base-bldcache-ubi2-oc-offload
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Resolve build profile fingerprint
+        id: profile
+        run: |
+          set -euo pipefail
+
+          fingerprint="$(
+            git ls-files -z -- user/default "user/${TARGET}" |
+              LC_ALL=C sort -z |
+              xargs -0 sha256sum |
+              sha256sum |
+              awk '{print $1}'
+          )"
+          [ -n "${fingerprint}" ]
+          printf 'fingerprint=%s\n' "${fingerprint}" >> "${GITHUB_OUTPUT}"
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GHCR_TOKEN }}
+
+      - name: Resolve current OpenWrt kmods
+        id: kmods
+        run: |
+          set -euo pipefail
+
+          latest_kmod="$(
+            curl --fail --silent --show-error --location \
+              https://downloads.openwrt.org/snapshots/targets/airoha/an7581/kmods/ |
+              grep '<tr>' |
+              grep 'href="' |
+              while read -r line; do
+                directory="$(grep -oP 'href="\K[^"/]*' <<< "${line}")"
+                date_string="$(grep -oP 'class="d">\K[^<]*' <<< "${line}")"
+                epoch="$(date -d "${date_string}" +%s 2>/dev/null || true)"
+                if [ -n "${directory}" ] && [ -n "${epoch}" ]; then
+                  printf '%s %s\n' "${epoch}" "${directory}"
+                fi
+              done |
+              sort -rn |
+              head -n 1 |
+              awk '{print $2}'
+          )"
+          [ -n "${latest_kmod}" ] || {
+            printf 'Unable to resolve the current OpenWrt kmods directory\n' >&2
+            exit 1
+          }
+          printf 'version=%s\n' "${latest_kmod}" >> "${GITHUB_OUTPUT}"
+
+      - name: Restore OpenWrt repository metadata
+        id: metadata_cache
+        uses: actions/cache/restore@v5
+        continue-on-error: true
+        with:
+          path: metadata
+          key: openwrt-kmods-${{ steps.kmods.outputs.version }}.${{ github.run_id }}.${{ github.run_attempt }}
+          restore-keys: |
+            openwrt-kmods-${{ steps.kmods.outputs.version }}.
+            openwrt-kmods-${{ steps.kmods.outputs.version }}
+
+      - name: Inspect restored OpenWrt repository metadata
+        id: metadata
+        env:
+          KMOD_VERSION: ${{ steps.kmods.outputs.version }}
+          RESTORE_OUTCOME: ${{ steps.metadata_cache.outcome }}
+        run: |
+          set -euo pipefail
+
+          valid=false
+          expected_vermagic="${KMOD_VERSION##*-}"
+          if [ "${RESTORE_OUTCOME}" = success ] &&
+            [ -s metadata/distfeeds.list ] &&
+            [ -s metadata/vermagic.txt ] &&
+            grep -Fq "/kmods/${KMOD_VERSION}/" metadata/distfeeds.list &&
+            [ "$(tr -d '\n' < metadata/vermagic.txt)" = "${expected_vermagic}" ]; then
+            valid=true
+          else
+            rm -rf metadata
+          fi
+          printf 'valid=%s\n' "${valid}" >> "${GITHUB_OUTPUT}"
+
+      - name: Extract OpenWrt repository metadata
+        if: steps.metadata.outputs.valid != 'true'
+        run: |
+          set -euo pipefail
+
+          sudo apt-get update -qq
+          sudo apt-get install -y binwalk
+          rm -rf metadata _sysupgrade.bin.extracted sysupgrade.bin
+          mkdir -p metadata
+          curl --fail --location \
+            https://downloads.openwrt.org/snapshots/targets/airoha/an7581/openwrt-airoha-an7581-airoha_an7581-evb-squashfs-sysupgrade.bin \
+            --output sysupgrade.bin
+          binwalk -e sysupgrade.bin
+          install -m 644 \
+            _sysupgrade.bin.extracted/squashfs-root/etc/apk/repositories.d/distfeeds.list \
+            metadata/distfeeds.list
+          awk -F/ '
+            /\/kmods\// {
+              count = split($(NF - 1), fields, "-")
+              print fields[count]
+              exit
+            }
+          ' metadata/distfeeds.list > metadata/vermagic.txt
+
+      - name: Validate OpenWrt repository metadata
+        env:
+          KMOD_VERSION: ${{ steps.kmods.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          expected_vermagic="${KMOD_VERSION##*-}"
+          test -s metadata/distfeeds.list
+          test -s metadata/vermagic.txt
+          grep -Fq "/kmods/${KMOD_VERSION}/" metadata/distfeeds.list
+          [ "$(tr -d '\n' < metadata/vermagic.txt)" = "${expected_vermagic}" ]
+
+      - name: Save repaired OpenWrt repository metadata
+        if: steps.metadata.outputs.valid != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: metadata
+          key: openwrt-kmods-${{ steps.kmods.outputs.version }}.${{ github.run_id }}.${{ github.run_attempt }}
+
+      - name: Restore compile caches
+        id: compile_cache
+        if: inputs.clean_rebuild != true
+        uses: actions/cache/restore@v5
+        continue-on-error: true
+        with:
+          path: |
+            ghcache
+            stcache
+          key: cache-${{ env.TARGET }}-${{ env.CACHE_SCHEMA }}-${{ steps.profile.outputs.fingerprint }}.${{ github.run_id }}.${{ github.run_attempt }}
+          restore-keys: cache-${{ env.TARGET }}-${{ env.CACHE_SCHEMA }}-${{ steps.profile.outputs.fingerprint }}.
+
+      - name: Restore download cache
+        id: download_cache
+        if: inputs.clean_rebuild != true
+        uses: actions/cache/restore@v5
+        continue-on-error: true
+        with:
+          path: dlcache
+          key: dlcache-${{ env.CACHE_SCHEMA }}.${{ github.run_id }}.${{ github.run_attempt }}
+          restore-keys: dlcache-${{ env.CACHE_SCHEMA }}.
+
+      - name: Seed caches if missing
+        env:
+          CLEAN_REBUILD: ${{ inputs.clean_rebuild }}
+          COMPILE_CACHE_OUTCOME: ${{ steps.compile_cache.outcome }}
+          DOWNLOAD_CACHE_OUTCOME: ${{ steps.download_cache.outcome }}
+        run: |
+          set -euo pipefail
+
+          if [ "${CLEAN_REBUILD}" = true ] ||
+            [ "${COMPILE_CACHE_OUTCOME}" != success ]; then
+            rm -rf ghcache stcache
+          fi
+          if [ "${CLEAN_REBUILD}" = true ] ||
+            [ "${DOWNLOAD_CACHE_OUTCOME}" != success ]; then
+            rm -rf dlcache
+          fi
+          mkdir -p openwrt_bin ghcache stcache dlcache
+
+          if [ "${CLEAN_REBUILD}" = true ]; then
+            exit 0
+          fi
+
+          if [ -z "$(ls -A ghcache 2>&-)" ] || [ -z "$(ls -A stcache 2>&-)" ]; then
+            image="ghcr.io/${{ github.repository_owner }}/w1700k-builders:base-bldcache-${TARGET}"
+            if ! docker pull "${image}" 2>&-; then
+              image="${IMG_PUBLIC_CACHE}"
+              docker pull "${image}" 2>&- || image=
+            fi
+            if [ -n "${image}" ] &&
+              docker create --name CACHE_SEED "${image}" >/dev/null; then
+              for directory in ghcache stcache dlcache; do
+                if [ -z "$(ls -A "${directory}" 2>&-)" ]; then
+                  docker cp "CACHE_SEED:/${directory}/." "${directory}" 2>&- || true
+                fi
+              done
+              docker rm CACHE_SEED >/dev/null
+            fi
+          fi
+
+      - name: Initialize build workspace
+        run: |
+          set -euo pipefail
+
+          install -D -m 644 metadata/distfeeds.list \
+            user/default/files/etc/apk/repositories.d/distfeeds.list
+          install -D -m 644 metadata/vermagic.txt \
+            user/default/files/etc/vermagic.txt
+          [ -f "user/${TARGET}/config.diff" ] || {
+            printf '::error::config.diff not found for %s\n' "${TARGET}"
+            exit 1
+          }
+          rm -rf user/current
+          rsync -aI --mkpath user/default/ "user/${TARGET}/" user/current/ 2>&-
+          printf 'CONFIG_CCACHE_DIR="/ghcache"\n' >> user/current/config.diff
+          sudo tee /etc/docker/daemon.json >/dev/null <<'JSON'
+          {"max-concurrent-downloads":50,"max-concurrent-uploads":50,"experimental":true}
+          JSON
+          sudo systemctl reload docker
+
+          sudo install -m 755 /dev/stdin /usr/local/bin/docker_exec <<'DOCKER_EXEC'
+          #!/bin/bash
+          set -u
+          environment=()
+          for name in DK_BIN DK_USER DK_PROFILE DK_OPENWRT REPO_SECRET TARGET; do
+            environment+=(--env "${name}=${!name}")
+          done
+          exec docker exec -u 0 -i "${environment[@]}" "$@"
+          DOCKER_EXEC
+
+      - name: Build OpenWrt with clean fallback
+        env:
+          CLEAN_REBUILD: ${{ inputs.clean_rebuild }}
+          PROFILE_FINGERPRINT: ${{ steps.profile.outputs.fingerprint }}
+        run: |
+          set -uo pipefail
+
+          start_container() {
+            local image="${1}"
+
+            docker rm -f DK >/dev/null 2>&1 || true
+            docker run -dt --name DK \
+              -v "${PWD}/user:${DK_USER}" \
+              -v "${PWD}/openwrt_bin:${DK_BIN}" \
+              -v "${PWD}/ghcache:/ghcache" \
+              -v "${PWD}/stcache:/stcache" \
+              -v "${PWD}/dlcache:/dlcache" \
+              "${image}" || return 1
+            # The variables belong to the shell running inside the container.
+            # shellcheck disable=SC2016
+            docker_exec DK bash -c '
+              set -eu
+              command -v git >/dev/null
+              command -v make >/dev/null
+              test -d "$DK_OPENWRT"
+            ' || return 1
+          }
+
+          prepare_source() {
+            # shellcheck disable=SC2016
+            docker_exec DK bash -c '
+              set -euo pipefail
+              # shellcheck disable=SC1091
+              . "$DK_USER/default/settings.ini" &>/dev/null || true
+              # shellcheck disable=SC1091
+              . "$DK_PROFILE/settings.ini"
+              [[ ${REPO_URL:-} && ${REPO_BRANCH:-} ]] || {
+                echo "::error::Missing REPO_URL or REPO_BRANCH"
+                exit 1
+              }
+
+              mkdir -p "$DK_OPENWRT"
+              cd "$DK_OPENWRT"
+              if [ ! -d .git ]; then
+                git init
+              fi
+              git reset --hard HEAD &>/dev/null || true
+              git clean -ffdx
+              git remote set-url origin "$REPO_URL" 2>&- || \
+                git remote add origin "$REPO_URL"
+              git config remote.origin.tagOpt --no-tags
+              git fetch --no-tags origin \
+                "+refs/heads/$REPO_BRANCH:refs/remotes/origin/$REPO_BRANCH"
+              git checkout -f -B "$REPO_BRANCH" "origin/$REPO_BRANCH"
+              git reset --hard "origin/$REPO_BRANCH"
+              git clean -ffdx
+              mkdir -p files
+
+              if [[ ${UPSTREAM_URL:-} && ${UPSTREAM_BRANCH:-} ]]; then
+                git fetch --no-tags "$UPSTREAM_URL" \
+                  "+refs/heads/$UPSTREAM_BRANCH:refs/remotes/upstream/$UPSTREAM_BRANCH"
+                git log "refs/remotes/upstream/$UPSTREAM_BRANCH..HEAD" \
+                  --oneline --no-decorate > files/build_info
+              else
+                echo "(upstream branch is not configured)" > files/build_info
+              fi
+
+              mountpoint "$DK_BIN" || {
+                echo "::error::not mounted" >&2
+                exit 1
+              }
+              cp files/build_info "$DK_BIN"
+              ln -sfn "$DK_BIN" bin
+              ln -sfn /dlcache dl
+              ln -sfn /stcache staging_dir
+
+              build_profile="$DK_PROFILE"
+              feeds_config=feeds.conf
+              rm -f /tmp/feeds.bak
+              if cp "$build_profile/files/$feeds_config" "$feeds_config" 2>&-; then
+                cp "$feeds_config" /tmp/feeds.bak
+              fi
+              rm -rf feeds
+              ./scripts/feeds update -a &>/dev/null
+              ./scripts/feeds install -a
+              mv /tmp/feeds.bak "$feeds_config" &>/dev/null || true
+              cp "$build_profile/config.diff" .config
+              cat "$build_profile"/patches/*.patch 2>&- |
+                patch -d . -p0 --forward || true
+              cp -r "$build_profile/files/." files/ &>/dev/null || true
+              bash "$build_profile/custom.sh" &>/dev/null || true
+              rm -rf tmp
+              make defconfig
+              printf "CONFIG_VERSION_NUMBER=%s\n" "$TARGET" >> .config
+
+              download_log="$(mktemp)"
+              set +e
+              make download -j8 2>&1 | tee "$download_log"
+              download_status=${PIPESTATUS[0]}
+              set -e
+              if [ "$download_status" -ne 0 ] || grep -q "ERROR:" "$download_log"; then
+                rm -f "$download_log"
+                exit 1
+              fi
+              rm -f "$download_log"
+            '
+          }
+
+          compile_source() {
+            local mode
+
+            for mode in c s; do
+              printf 'Compiling OpenWrt with V=%s\n' "${mode}"
+              # shellcheck disable=SC2016
+              if docker_exec --env MODE="${mode}" DK bash -c '
+                set -uo pipefail
+                bash "$DK_PROFILE/pre_compile.sh" 2>&- || true
+                cd "$DK_OPENWRT" || exit 1
+                export FORCE_UNSAFE_CONFIGURE=1
+                export CCACHE_SLOPPINESS=file_stat_matches,include_file_mtime,time_macros
+                export CCACHE_NOHASHDIR=true
+                export CCACHE_COMPILERCHECK=content
+                make -j"$(($(nproc) + 1))" "V=$MODE"
+                build_status=$?
+                staging_dir/host/bin/ccache -d /ghcache -sz || true
+                exit "$build_status"
+              '; then
+                return 0
+              fi
+            done
+            return 1
+          }
+
+          build_attempt() {
+            local image="${1}"
+
+            ATTEMPT_STAGE=container
+            start_container "${image}" || return 1
+            ATTEMPT_STAGE=prepare
+            prepare_source || return 1
+            ATTEMPT_STAGE=compile
+            compile_source || return 1
+            ATTEMPT_STAGE=complete
+          }
+
+          reset_attempt_state() {
+            local clear_download="${1}"
+
+            docker rm -f DK >/dev/null 2>&1 || true
+            sudo rm -rf openwrt_bin ghcache stcache
+            mkdir -p openwrt_bin ghcache stcache dlcache
+            if [ "${clear_download}" = true ]; then
+              sudo rm -rf dlcache
+              mkdir -p dlcache
+            fi
+          }
+
+          select_initial_image() {
+            local image_profile schema
+
+            if [ "${CLEAN_REBUILD}" = true ]; then
+              docker pull "${IMG_PUBLIC_BASE}" || return 1
+              INITIAL_IMAGE="${IMG_PUBLIC_BASE}"
+              return 0
+            fi
+
+            if docker pull "${IMG_INC}"; then
+              schema="$(
+                docker image inspect "${IMG_INC}" \
+                  --format '{{ index .Config.Labels "io.openw1700k.fastbuild-schema" }}' \
+                  2>/dev/null || true
+              )"
+              image_profile="$(
+                docker image inspect "${IMG_INC}" \
+                  --format '{{ index .Config.Labels "io.openw1700k.profile" }}' \
+                  2>/dev/null || true
+              )"
+              if [ "${schema}" = "${BUILD_ENV_SCHEMA}" ] &&
+                [ "${image_profile}" = "${PROFILE_FINGERPRINT}" ]; then
+                INITIAL_IMAGE="${IMG_INC}"
+                return 0
+              fi
+              printf 'Reusable image schema/profile mismatch; ignoring it.\n'
+            fi
+
+            if docker pull "${IMG_BASE}"; then
+              INITIAL_IMAGE="${IMG_BASE}"
+              return 0
+            fi
+            docker pull "${IMG_PUBLIC_BASE}" || return 1
+            INITIAL_IMAGE="${IMG_PUBLIC_BASE}"
+          }
+
+          ATTEMPT_STAGE=initial
+          INITIAL_IMAGE=
+          fallback_used=false
+          download_reset=false
+          select_initial_image || exit 1
+
+          if build_attempt "${INITIAL_IMAGE}"; then
+            printf 'Incremental build succeeded with %s.\n' "${INITIAL_IMAGE}"
+          elif [ "${CLEAN_REBUILD}" = true ]; then
+            printf 'Clean rebuild failed during %s.\n' "${ATTEMPT_STAGE}" >&2
+            exit 1
+          else
+            fallback_used=true
+            printf 'Incremental build failed during %s; retrying from a clean public base.\n' \
+              "${ATTEMPT_STAGE}" >&2
+            reset_attempt_state false
+            docker pull "${IMG_PUBLIC_BASE}" || exit 1
+
+            if ! build_attempt "${IMG_PUBLIC_BASE}"; then
+              if [ "${ATTEMPT_STAGE}" = prepare ] && [ -n "$(ls -A dlcache 2>&-)" ]; then
+                download_reset=true
+                printf 'Clean preparation failed; clearing downloads and retrying once.\n' >&2
+                reset_attempt_state true
+                build_attempt "${IMG_PUBLIC_BASE}" || {
+                  printf 'Fully clean build failed during %s.\n' "${ATTEMPT_STAGE}" >&2
+                  exit 1
+                }
+              else
+                printf 'Clean fallback failed during %s.\n' "${ATTEMPT_STAGE}" >&2
+                exit 1
+              fi
+            fi
+          fi
+
+          # The backticks are literal Markdown in the step summary.
+          # shellcheck disable=SC2016
+          {
+            printf '### Build recovery\n\n'
+            printf -- '- Initial image: `%s`\n' "${INITIAL_IMAGE}"
+            printf -- '- Clean fallback used: `%s`\n' "${fallback_used}"
+            printf -- '- Download cache reset: `%s`\n' "${download_reset}"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Create release
+        run: |
+          set -euo pipefail
+
+          sudo chown -R "$(id -u):$(id -g)" \
+            openwrt_bin ghcache stcache dlcache
+          find -L openwrt_bin/targets/*/* -maxdepth 1 -type f \
+            -exec install -D -t firmware {} +
+          version="${TARGET}_$(date +'%Y.%m.%d')_$(
+            jq -r '.version_code' firmware/profiles.json
+          )"
+          sed -i "s/^/    /; 1s/^/## ${version}\n\n/" openwrt_bin/build_info
+          gh release list --limit 1000 --json tagName --jq '.[].tagName' |
+            grep "^${TARGET}_" |
+            xargs -r gh release delete --cleanup-tag -y || true
+          gh release create "${version}" firmware/*sysupgrade.itb \
+            --title "${version}" --notes-file openwrt_bin/build_info
+
+      - name: Save reusable build environment
+        env:
+          PROFILE_FINGERPRINT: ${{ steps.profile.outputs.fingerprint }}
+        run: |
+          set -euo pipefail
+
+          # shellcheck disable=SC2016
+          docker_exec DK bash -c \
+            'cd "$DK_OPENWRT" && rm -rf bin build_dir feeds tmp'
+          docker commit \
+            --change "LABEL io.openw1700k.fastbuild-schema=${BUILD_ENV_SCHEMA}" \
+            --change "LABEL io.openw1700k.profile=${PROFILE_FINGERPRINT}" \
+            -a openwrt-fastbuild \
+            -m "Building at $(date)" DK "${IMG_INC}"
+          docker push "${IMG_INC}"
+
+      - name: Save compile caches
+        uses: actions/cache/save@v5
+        with:
+          path: |
+            ghcache
+            stcache
+          key: cache-${{ env.TARGET }}-${{ env.CACHE_SCHEMA }}-${{ steps.profile.outputs.fingerprint }}.${{ github.run_id }}.${{ github.run_attempt }}
+
+      - name: Save download cache
+        uses: actions/cache/save@v5
+        with:
+          path: dlcache
+          key: dlcache-${{ env.CACHE_SCHEMA }}.${{ github.run_id }}.${{ github.run_attempt }}
+
+      - name: Delete superseded compile caches
+        env:
+          CURRENT_COMPILE_CACHE: cache-${{ env.TARGET }}-${{ env.CACHE_SCHEMA }}-${{ steps.profile.outputs.fingerprint }}.${{ github.run_id }}.${{ github.run_attempt }}
+          CURRENT_DOWNLOAD_CACHE: dlcache-${{ env.CACHE_SCHEMA }}.${{ github.run_id }}.${{ github.run_attempt }}
+        run: |
+          set -uo pipefail
+
+          gh cache list --limit 10000 --json key,id --jq \
+            '.[] | [.id, .key] | @tsv' |
+            while IFS=$'\t' read -r id key; do
+              if [ "${key}" = "${CURRENT_COMPILE_CACHE}" ] ||
+                [ "${key}" = "${CURRENT_DOWNLOAD_CACHE}" ]; then
+                continue
+              fi
+              if [[ "${key}" = "cache-${TARGET}-"* ||
+                "${key}" = "cache-${TARGET}."* ||
+                "${key}" = dlcache-* ||
+                "${key}" = dlcache.* ]]; then
+                gh cache delete "${id}" || true
+              fi
+            done
+        continue-on-error: true
+
+      - name: Delete superseded GHCR images
+        uses: dataaxiom/ghcr-cleanup-action@v1
+        with:
+          token: ${{ secrets.GHCR_TOKEN }}
+          package: w1700k-builders
+        continue-on-error: true

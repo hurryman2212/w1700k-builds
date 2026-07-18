@@ -1,0 +1,34 @@
+name: update ubi2-oc-offload
+
+on:
+  workflow_dispatch:
+    inputs:
+      force_recompose:
+        description: Recompose even when the generated and final trees are unchanged
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: update-ubi2-oc-offload
+  cancel-in-progress: false
+
+jobs:
+  compose:
+    name: Compose source branch
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: ubi2-oc-offload
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Compose private source branch
+        env:
+          FORCE_RECOMPOSE: ${{ inputs.force_recompose || false }}
+          REMOTE_REPOSITORY: hurryman2212/OpenW1700k-test
+          REPO_SECRET: ${{ secrets.REPO_SECRET }}
+          SOURCE_BRANCH: ubi2-oc-offload
+        run: .github/scripts/sync-source.sh
